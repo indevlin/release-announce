@@ -1,0 +1,31 @@
+{
+  "private": true,
+  "name": "release-announce",
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "devvit playtest",
+    "deploy": "npm run build && devvit upload",
+    "login": "devvit login",
+    "launch": "npm run build && npm run deploy && devvit publish",
+    "type-check": "tsc --build"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "dependencies": {
+    "@devvit/start": "0.15.4",
+    "@devvit/web": "0.15.4"
+  },
+  "devDependencies": {
+    "@types/node": "22.12.0",
+    "devvit": "0.15.4",
+    "typescript": "npm:@typescript/typescript6@6.0.2"
+  },
+  "overrides": {
+    "isomorphic-git": "^1.44.17",
+    "tmp": "^0.2.7"
+  }
+}

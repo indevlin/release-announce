@@ -1,0 +1,237 @@
+name: Release
+
+# Triggers:
+#
+#   1. push: tags: ['[0-9]*']
+#      Any tag push or force-push, from any branch.
+#      Test build:  git push origin YYYYMMDD
+#      Re-trigger:  git push --force origin YYYYMMDD
+#
+#   2. release: types: [published]
+#      Publishing a release in the GitHub UI.
+#
+#   3. workflow_dispatch (Actions > Release > Run workflow)
+#      Builds and checks any branch without a tag. With dry_run on (the
+#      default) nothing is published.
+#
+# Tags are bare YYYYMMDD datestamps matching the version file. A suffix such
+# as 20261118-rc1 publishes a prerelease.
+#
+# Release notes come from the "## Released in YYYYMMDD" section of
+# CHANGELOG.md. GitHub attaches its own source archives to every release.
+#
+# The app itself is published to Reddit with the devvit CLI, not here.
+
+on:
+  push:
+    tags: ["[0-9]*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and check without publishing a release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+
+# -- Job 1: Verify the tag ---------------------------------------------------
+
+  verify:
+    name: Verify tag matches the version file
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref_name }}
+          fetch-depth: 1
+
+      # Compares tag to version file on tag refs; publishes the version file
+      # value for later jobs on every ref.
+      - id: read
+        name: Read and check the version
+        shell: bash
+        run: |
+          VERSION="$(tr -d '[:space:]' < version)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version file: ${VERSION}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            if [ "${TAG}" != "${VERSION}" ]; then
+              echo "::error::Tag '${TAG}' does not match the version" \
+                   "file ('${VERSION}'). Tags are bare datestamps with no" \
+                   "'v' prefix. Update 'version' or move the tag."
+              exit 1
+            fi
+          fi
+
+      - name: Preflight — required paths are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          MISSING=0
+          for path in package.json package-lock.json devvit.json \
+                      tsconfig.json vite.config.ts src/server/index.ts \
+                      version CHANGELOG.md LICENSE; do
+            if [ ! -e "$path" ]; then
+              echo "::error::Missing from the repository: $path"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::The checkout is incomplete. If a file exists" \
+                 "locally but not here, check .gitignore is not excluding it."
+            exit 1
+          fi
+          echo "All required paths present."
+
+# -- Job 2: Build and check --------------------------------------------------
+
+  build:
+    name: Build and check
+    runs-on: ubuntu-latest
+    needs: [verify]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref_name }}
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Type-check
+        run: npm run type-check
+
+      - name: Build
+        run: npm run build
+
+      # Server entry named in devvit.json must exist and parse.
+      - name: Check the server bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENTRY="dist/server/$(node -p "require('./devvit.json').server.entry")"
+          test -s "$ENTRY" || { echo "::error::Build produced no $ENTRY."; exit 1; }
+          node --check "$ENTRY"
+          ls -lh dist/server/
+
+# -- Job 3: Publish the release ----------------------------------------------
+# Skipped for a dry run and for any run not on a tag.
+
+  release:
+    name: Publish release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag' && !inputs.dry_run
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref_name }}
+          fetch-depth: 1
+
+      # Section runs from "## Released in <version>" to the next such heading.
+      - name: Extract release notes from the changelog
+        shell: bash
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          awk -v v="$VERSION" '
+            $0 ~ "^## Released in " v "[[:space:]]*$" { flag = 1; next }
+            flag && /^## Released in / { exit }
+            flag { print }
+          ' CHANGELOG.md > release-notes.md
+
+          sed -i -e '/./,$!d' release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::No '## Released in ${VERSION}' section in CHANGELOG.md."
+            exit 1
+          fi
+
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "Install on your subreddit: https://developers.reddit.com/apps/release-announce"
+          } >> release-notes.md
+
+          echo "----- release notes -----"
+          cat release-notes.md
+
+      # Existing release is updated in place; a bare datestamp is marked
+      # Latest only when no published full release has a later datestamp.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.verify.outputs.version }}"
+
+          NEWEST="$(gh release list --limit 200 --exclude-drafts \
+                      --exclude-pre-releases --json tagName -q '.[].tagName' |
+                    grep -E '^[0-9]{8}$' | sort -r | head -n 1 || true)"
+          FLAGS=()
+          LATEST=false
+          case "$VERSION" in
+            *-*) FLAGS+=(--prerelease --latest=false) ;;
+            *)
+              if [ -z "$NEWEST" ] || ! [ "$NEWEST" \> "$VERSION" ]; then
+                LATEST=true
+              fi
+              FLAGS+=("--latest=${LATEST}")
+              ;;
+          esac
+          echo "Newest published full release: ${NEWEST:-none}; ${VERSION} latest: ${LATEST}"
+
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION exists — updating it."
+            gh release edit "$VERSION" \
+              --notes-file release-notes.md \
+              --draft=false \
+              "${FLAGS[@]}"
+          else
+            echo "Creating release $VERSION."
+            gh release create "$VERSION" \
+              --title "release-announce $VERSION" \
+              --notes-file release-notes.md \
+              --verify-tag \
+              "${FLAGS[@]}"
+          fi
+
+          # Latest is re-applied and read back.
+          if [ "$LATEST" = true ]; then
+            REPO="${{ github.repository }}"
+            ID="$(gh api "repos/${REPO}/releases/tags/${VERSION}" -q .id)"
+            gh api -X PATCH "repos/${REPO}/releases/${ID}" -f make_latest=true >/dev/null
+            SHOWN="$(gh api "repos/${REPO}/releases/latest" -q .tag_name)"
+            if [ "$SHOWN" != "$VERSION" ]; then
+              echo "::error::Release ${VERSION} is published but GitHub reports" \
+                   "${SHOWN} as Latest."
+              exit 1
+            fi
+            echo "Latest: ${SHOWN}"
+          fi
+
+          echo "Published: $(gh release view "$VERSION" --json url -q .url)"
